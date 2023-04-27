@@ -11,6 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 
+from copy import deepcopy
+
 import pytest
 
 from smithy_python._private import URI, Field, Fields, HostType
@@ -22,6 +24,7 @@ from smithy_python._private.http import (
 )
 from smithy_python.async_utils import async_list
 from smithy_python.exceptions import SmithyHTTPException
+from smithy_python.interfaces import URIParameters
 
 
 def test_uri_basic() -> None:
@@ -60,6 +63,55 @@ def test_uri_all_fields_present() -> None:
     assert uri.fragment == "frag"
     assert uri.netloc == "abc:def@test.aws.dev:80"
     assert uri.build() == "http://abc:def@test.aws.dev:80/my/path?foo=bar#frag"
+
+
+@pytest.mark.parametrize(
+    "input_uri, expected_dict",
+    [
+        (
+            URI(
+                host="test.aws.dev",
+                path="/my/path",
+                scheme="http",
+                query="foo=bar",
+                port=80,
+                username="abc",
+                password="def",
+                fragment="frag",
+            ),
+            {
+                "host": "test.aws.dev",
+                "path": "/my/path",
+                "query": "foo=bar",
+                "scheme": "http",
+                "port": 80,
+                "username": "abc",
+                "password": "def",
+                "fragment": "frag",
+            },
+        ),
+        (
+            URI(
+                host="test.aws.dev",
+                path="/my/path",
+                query="foo=bar",
+            ),
+            {
+                "host": "test.aws.dev",
+                "path": "/my/path",
+                "query": "foo=bar",
+                "scheme": "https",
+                "port": None,
+                "username": None,
+                "password": None,
+                "fragment": None,
+            },
+        ),
+    ],
+)
+def test_uri_to_dict(input_uri: URI, expected_dict: URIParameters) -> None:
+    uri_dict = input_uri.to_dict()
+    assert uri_dict == expected_dict
 
 
 def test_uri_without_scheme_field() -> None:
@@ -129,6 +181,30 @@ async def test_request() -> None:
     assert request.fields == headers
     request_body = b"".join([chunk async for chunk in request.body])
     assert request_body == b"test body"
+
+
+async def test_request_deepcopy() -> None:
+    uri = URI(host="test.aws.dev")
+    headers = Fields([Field(name="foo", values=["bar"])])
+    request = HTTPRequest(
+        method="GET",
+        destination=uri,
+        fields=headers,
+        body=async_list([b"test body"]),
+    )
+
+    request_copy = deepcopy(request)
+    assert request_copy.method is request.method
+    assert request_copy.destination is uri
+    assert request_copy.fields is not headers
+    assert request_copy.fields == headers
+    assert request_copy.body is request.body
+    request_copy_body = b"".join([chunk async for chunk in request_copy.body])
+    assert request_copy_body == b"test body"
+
+    memo = {id(request_copy): request_copy}
+    request_copy_deepcopy = deepcopy(request_copy, memo)
+    assert request_copy_deepcopy is request_copy
 
 
 async def test_response() -> None:
