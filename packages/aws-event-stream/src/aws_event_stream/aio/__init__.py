@@ -14,8 +14,10 @@ from smithy_core.aio.interfaces import AsyncWriter
 
 from .._private.serializers import EventSerializer as _EventSerializer
 from .._private.deserializers import EventDeserializer as _EventDeserializer
-from ..events import Event, EventMessage
+from ..events import Event, EventHeaderEncoder, EventMessage
 from ..exceptions import EventError
+
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +59,9 @@ class AWSEventPublisher[E: SerializeableShape](EventPublisher[E]):
                 "Expected an event message to be serialized, but was None."
             )
         if self._signer is not None:
-            result = self._signer(result)
+            result = self._signer.sign_event(result)  # type: ignore
 
+        assert isinstance(result, EventMessage)
         encoded_result = result.encode()
         try:
             logger.debug("Publishing serialized event: %s", result)
