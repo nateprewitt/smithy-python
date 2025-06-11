@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 from smithy_core import URI
 from smithy_core.aio.interfaces.identity import IdentityResolver
@@ -23,24 +24,13 @@ _CONTAINER_METADATA_ALLOWED_HOSTS = {
 }
 _DEFAULT_TIMEOUT = 2
 _DEFAULT_RETRIES = 3
-_DEFAULT_SLEEP_SECONDS = 1
+_SLEEP_SECONDS = 1
 
 
-@dataclass(init=False)
+@dataclass
 class ContainerCredentialConfig:
-    endpoint: URI
-    timeout: int
-    retries: int
-
-    def __init__(
-        self,
-        endpoint: URI = None,
-        timeout: int = _DEFAULT_TIMEOUT,
-        retries: int = _DEFAULT_RETRIES,
-    ):
-        self.endpoint = endpoint or URI(scheme="http", host=_CONTAINER_METADATA_IP)
-        self.timeout = timeout
-        self.retries = retries
+    timeout: int = _DEFAULT_TIMEOUT
+    retries: int = _DEFAULT_RETRIES
 
 
 class ContainerMetadataClient:
@@ -48,20 +38,20 @@ class ContainerMetadataClient:
         self._http_client = http_client
         self._config = config
 
-    @staticmethod
-    def _validate_allowed_url(uri: URI) -> None:
+    def _validate_allowed_url(self, uri: URI) -> None:
         if self._is_loopback(uri.host):
             return
 
         if not self._is_allowed_container_metadata_host(uri.host):
             raise SmithyIdentityError(
-                f"Unsupported host '{hostname}'. "
+                f"Unsupported host '{uri.host}'. "
                 f"Can only retrieve metadata from a loopback address or "
                 f"one of: {', '.join(_CONTAINER_METADATA_ALLOWED_HOSTS)}"
             )
 
-    async def _retrieve(self, uri: URI, headers: Fields | None = None) -> dict:
+    async def get_credentials(self, uri: URI, fields: Fields) -> dict:
         self._validate_allowed_url(uri)
+        fields.set_field(Field(name="Accept", values=["application/json"]))
 
         attempts = 0
         last_exc = None
@@ -70,7 +60,7 @@ class ContainerMetadataClient:
                 request = HTTPRequest(
                     method="GET",
                     destination=uri,
-                    fields=headers or Fields([Field(name="Accept", values=["application/json"])]),
+                    fields=fields,
                 )
                 response = await self._http_client.send(request)
                 body = await response.consume_body_async()
@@ -94,17 +84,7 @@ class ContainerMetadataClient:
             f"Failed to retrieve container metadata after {self._config.retries} attempts"
         ) from last_exc
 
-    async def get_credentials(self, relative_uri: str) -> dict:
-        uri = URI(
-            scheme=self._config.endpoint.scheme,
-            host=self._config.endpoint.host,
-            port=self._config.endpoint.port,
-            path=relative_uri,
-        )
-        return await self._retrieve(uri)
-
     def _is_loopback(self, hostname: str) -> bool:
-
         try:
             return ipaddress.ip_address(hostname).is_loopback
         except ValueError:
@@ -121,29 +101,65 @@ class ContainerCredentialResolver(
     Resolves AWS Credentials from container credential sources.
     """
 
+    ENV_VAR = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+    ENV_VAR_FULL = "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+    ENV_VAR_AUTH_TOKEN = "AWS_CONTAINER_AUTHORIZATION_TOKEN"
+    ENV_VAR_AUTH_TOKEN_FILE = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+
     def __init__(
         self,
         http_client: HTTPClient,
         config: ContainerCredentialConfig = None,
-        relative_uri: str = None,
     ):
         self._http_client = http_client
         self._config = config or ContainerCredentialConfig()
-        self._relative_uri = relative_uri or self._get_relative_uri_from_env()
+        # These must be awaited, so moved to get_identity
         self._client = ContainerMetadataClient(http_client, self._config)
         self._credentials = None
 
-    @staticmethod
-    def _get_relative_uri_from_env() -> str:
-        uri = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
-        if not uri:
-            raise SmithyIdentityError("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI environment variable is not set")
-        return uri
+    async def _resolve_uri_from_env(self) -> URI:
+        if self.ENV_VAR in os.environ:
+            return URI(
+                scheme="http", host=_CONTAINER_METADATA_IP, path=os.environ[self.ENV_VAR]
+            )
+        elif self.ENV_VAR_FULL in os.environ:
+            parsed = urlparse(os.environ[self.ENV_VAR_FULL])
+            return URI(
+                scheme=parsed.scheme,
+                host=parsed.hostname,
+                port=parsed.port,
+                path=parsed.path,
+            )
+        else:
+            raise SmithyIdentityError(
+                f"Neither {self.ENV_VAR} or {self.ENV_VAR_FULL} environment "
+                "variables are set. Unable to resolve credentials."
+            )
+
+    async def _resolve_fields_from_env(self) -> Fields:
+        fields = Fields()
+        if self.ENV_VAR_AUTH_TOKEN_FILE in os.environ:
+            try:
+                with open(os.environ[self.ENV_VAR_AUTH_TOKEN_FILE], "r", encoding="utf-8") as f:
+                    auth_token = f.read().strip()
+            except (FileNotFoundError, PermissionError) as e:
+                raise SmithyIdentityError(
+                    f"Unable to open {os.environ[self.ENV_VAR_AUTH_TOKEN_FILE]}."
+                ) from e
+
+            fields.set_field(Field(name="Authorization", values=[auth_token]))
+        elif self.ENV_VAR_AUTH_TOKEN in os.environ:
+            auth_token = os.environ[self.ENV_VAR_AUTH_TOKEN]
+            fields.set_field(Field(name="Authorization", values=[auth_token]))
+
+        return fields
 
     async def get_identity(
         self, *, properties: AWSIdentityProperties
     ) -> AWSCredentialsIdentity:
-        creds = await self._client.get_credentials(self._relative_uri)
+        uri = await self._resolve_uri_from_env()
+        fields = await self._resolve_fields_from_env()
+        creds = await self._client.get_credentials(uri, fields)
         access_key_id = creds.get("AccessKeyId")
         secret_access_key = creds.get("SecretAccessKey")
         session_token = creds.get("Token")
@@ -151,15 +167,18 @@ class ContainerCredentialResolver(
         account_id = creds.get("AccountId", None)
 
         if expiration is not None:
-            expiration = datetime.fromisoformat(expiration.replace("Z", "+00:00")).replace(tzinfo=UTC)
+            expiration = datetime.fromisoformat(expiration).replace(tzinfo=UTC)
 
         if access_key_id is None or secret_access_key is None:
-            raise SmithyIdentityError("AccessKeyId and SecretAccessKey are required for container credentials")
+            raise SmithyIdentityError(
+                "AccessKeyId and SecretAccessKey are required for container credentials"
+            )
 
-        return AWSCredentialsIdentity(
+        self._credentials = AWSCredentialsIdentity(
             access_key_id=access_key_id,
             secret_access_key=secret_access_key,
             session_token=session_token,
             expiration=expiration,
             account_id=account_id,
         )
+        return self._credentials
